@@ -1,0 +1,17 @@
+# Visual Studio / MSBuild
+.vs/
+[Oo]bj/
+[Bb]in/
+[Dd]ebug*/
+[Rr]elease*/
+*.user
+*.suo
+*.pch
+*.ilk
+*.log
+**/Generated Files/**
+
+# OS junk
+Thumbs.db
+.DS_Store
+node_modules/
