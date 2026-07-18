@@ -1,10 +1,19 @@
 # Porting react-native-worklets to react-native-windows — design
 
 Research target: **react-native-worklets 0.7.4** against **react-native-windows
-0.83.2** (New Architecture, Hermes, NuGet-prebuilt `Microsoft.ReactNative`,
-C++/WinRT `/std:c++20`). All package-structure claims below were made by
-reading the worklets 0.7.4 sources in `node_modules/react-native-worklets/`
-(July 2026).
+0.83.2** (New Architecture, Hermes, C++/WinRT `/std:c++20`). All
+package-structure claims below were made by reading the worklets 0.7.4 sources
+in `node_modules/react-native-worklets/` (July 2026).
+
+> **Revision, 2026-07-18.** §2 previously claimed the Hermes blocker was a
+> consequence of consuming `Microsoft.ReactNative` as a **prebuilt NuGet**, and
+> that an RNW **source build** would therefore unlock a concrete
+> `facebook::hermes::HermesRuntime`. **That was wrong**, and §2 is rewritten
+> below. The blocker is not prebuilt-vs-source: Hermes on Windows ships as a
+> **C-ABI / Node-API DLL with no C++ `HermesRuntime` class at all**, so RNW's
+> own source cannot reach one either. The conclusion ("worklets'
+> `WorkletHermesRuntime` cannot be compiled as written") survives; the reason
+> changed, and the shape of the workaround changed with it. Receipts in §2.
 
 ## 1. How react-native-worklets is built
 
@@ -68,19 +77,126 @@ makes the app throw at boot. Any Windows install must populate the **entire**
 proxy or not answer to the name at all. This repo's scaffold uses a distinct
 name (`RNWWorkletsRuntime`) for exactly this reason.
 
-## 2. Why a real runtime cannot be built app-side today
+## 2. Why `WorkletHermesRuntime` cannot be compiled on Windows — the real reason
 
-RNW 0.83's prebuilt `Microsoft.ReactNative` NuGet exposes the JS runtime to
-native code only as an **ABI/NAPI `jsi::Runtime` wrapper** (`JsiAbiApi.h` /
-NodeApiJsi) — **not** as a linkable `facebook::hermes::HermesRuntime` — and
-ships neither `hermes/hermes.h` nor a `MessageQueueThread` header on the app
-include path. The UI worklet runtime (a second Hermes VM sharing bytecode with
-the RN runtime) therefore cannot be constructed from an app project.
+This section was rewritten after actually checking a source build. The earlier
+version blamed NuGet consumption; the truth is more fundamental and, oddly,
+more tractable.
 
-| Option | Feasible app-side (NuGet)? | Notes |
+### 2a. The source build is real, and it does not help
+
+Our production app (Facilitron FIT for Windows) builds `Microsoft.ReactNative`
+**from source**, not from the NuGet:
+
+- `fit-mobile/windows/ExperimentalFeatures.props` sets
+  `<UseExperimentalNuget>false</UseExperimentalNuget>`.
+- `fit-mobile/windows/FitMobile.sln` carries the five RNW framework projects
+  (`Folly`, `fmt`, `ReactCommon`, `Common`, `Microsoft.ReactNative`) as
+  `node_modules/react-native-windows/**/*.vcxproj` references.
+- The artifact exists:
+  `node_modules/react-native-windows/target/ARM64/Debug/Microsoft.ReactNative/Microsoft.ReactNative.dll`.
+
+So "just build from source" is not a hypothetical for us — it is the shipping
+configuration. **It still does not yield a `facebook::hermes::HermesRuntime`.**
+
+### 2b. There is no C++ `HermesRuntime` on Windows, for anyone
+
+`hermes/hermes.h` — the header `WorkletHermesRuntime.h` includes — **does not
+exist anywhere in the dependency tree.** Searching `node_modules` and the
+restored NuGet cache for a path matching `hermes/hermes.h` returns nothing.
+
+What the pinned Hermes package
+(`~/.nuget/packages/microsoft.javascript.hermes/0.0.0-2607.16001-3c6569ec`,
+selected by `HermesVersion` in `ExperimentalFeatures.props`) actually ships
+under `build/native/include/` is:
+
+| Header | What it is |
+| --- | --- |
+| `hermes/hermes_api.h`, `hermes/hermes_icu.h`, `hermes/js_runtime_api.h` | **C ABI.** `jsr_*` / `hermes_*` free functions returning `napi_status`. |
+| `jsi/jsi.h`, `jsi/decorator.h`, `jsi/threadsafe.h`, … | Plain JSI. |
+| `node-api/js_native_api.h`, `node-api/node_api.h` | Node-API. |
+
+There is **no C++ class header** — no `facebook::hermes` namespace, no
+`makeHermesRuntime()`. Binaries under `build/native/win32/<arch>/` are
+`hermes.dll` + `hermes.lib`, exporting that C ABI.
+
+The one header in the tree named `hermes.h` is
+`node_modules/react-native/ReactCommon/jsi/jsi/hermes.h` (also vendored at
+`node_modules/.node-api-jsi/node-api-jsi-*/jsi/jsi/hermes.h`). That is
+`class IHermes : public jsi::ICast` — RN's **abstract** Hermes-capability
+interface (`getSHRuntime()`, `getVMRuntimeUnsafe()`), reached via
+`jsi::castInterface`. It is `<jsi/hermes.h>`, not `<hermes/hermes.h>`, and it
+is an interface, not the VM class worklets constructs.
+
+### 2c. RNW itself only ever holds a NAPI-backed `jsi::Runtime`
+
+The decisive file is
+`node_modules/react-native-windows/Shared/HermesRuntimeHolder.cpp` (compiled
+into the framework via `node_modules/react-native-windows/Shared/Shared.vcxitems`).
+It does not link Hermes as C++ at all — it resolves it **dynamically, by name**:
+
+```cpp
+class HermesFuncResolver : public IFuncResolver {
+ public:
+  HermesFuncResolver() : libHandle_(LoadLibraryAsPeerFirst(L"hermes.dll")) {}
+  FuncPtr getFuncPtr(const char *funcName) override {
+    return reinterpret_cast<FuncPtr>(GetProcAddress(libHandle_, funcName));
+  }
+  ...
+```
+
+…then wraps the resulting `napi_env` in `NodeApiJsiRuntime`
+(`node_modules/.node-api-jsi/node-api-jsi-*/src/NodeApiJsiRuntime.{h,cpp}`) to
+produce a `jsi::Runtime`. `JSEngine.props:15` even defaults `HermesNoLink=true`
+for Release, i.e. not linking Hermes statically is the *intended* posture.
+
+**Therefore:** the ABI/NAPI `jsi::Runtime` is not a NuGet-consumption artifact
+that a source build peels away. It is what `Microsoft.ReactNative` holds
+internally, in its own source, on every build configuration. A native module
+in the same process cannot obtain a concrete `HermesRuntime&` because **no
+component in the process has one.**
+
+### 2d. `JS_RUNTIME_HERMES` is not an RNW define
+
+Worklets guards its Hermes binding with `#if JS_RUNTIME_HERMES`
+(`WorkletHermesRuntime.h`). That symbol appears **nowhere** in
+`node_modules/react-native-windows/`. RNW's own Hermes switch is a different
+one: `React.Cpp.props:64` defines `USE_HERMES` when `$(UseHermes)=='true'`.
+Defining `JS_RUNTIME_HERMES` for a Windows worklets build is therefore an
+opt-in a porter would add — but doing so only activates a translation unit
+whose `#include <hermes/hermes.h>` cannot resolve (§2b).
+
+### 2e. What this *does* unlock — a second runtime, just not a `HermesRuntime`
+
+The refutation is not entirely bad news. Worklets needs a **second JS runtime
+it can drive from a non-JS thread**, and the C ABI exposes exactly that
+(`build/native/include/hermes/js_runtime_api.h`):
+
+- `jsr_create_config` / `jsr_create_runtime` / `jsr_delete_runtime` — create an
+  independent Hermes runtime instance in-process.
+- `jsr_config_set_task_runner` — give that runtime its own task runner, i.e.
+  its own thread. This is the seam a `WindowsUIScheduler` would drive.
+- `jsr_runtime_get_node_api_env` → a `napi_env`, which
+  `NodeApiJsiRuntime` turns into a `jsi::Runtime&` — the same construction RNW
+  uses for the main runtime (§2c).
+- `jsr_create_prepared_script` / `jsr_run_script_buffer` — the bytecode-ish
+  primitives worklets' function shipping would have to be rebuilt on.
+
+So the honest statement is **not** "a second Hermes VM is impossible on
+Windows." It is: *a second Hermes VM is reachable through the C ABI, but
+worklets' `WorkletHermesRuntime` is written against a C++ class that does not
+exist on this platform, so that file must be reimplemented rather than
+compiled.* Whether the NAPI path is sufficient — particularly for cross-runtime
+worklet serialization, which leans on Hermes bytecode sharing — is
+**unproven**, and is precisely what [`SPIKE.md`](SPIKE.md) is scoped to answer.
+
+### 2f. Options, restated
+
+| Option | Feasible? | Notes |
 | --- | --- | --- |
-| **A. Full worklets (separate UI Hermes runtime)** | **No.** | Needs concrete HermesRuntime + ReactCommon internals → requires an RNW **source build** (or an upstream RNW worklets port compiled inside `Microsoft.ReactNative`). |
-| **B. JS-thread-only worklets (no UI runtime)** | **Partially.** | Install `__workletsModuleProxy` over the ABI `jsi::Runtime`; `scheduleOnUI`/`runOnUI`/`runOnRuntime` execute the worklet **on the RN JS runtime**. Requires re-enabling the reanimated babel plugin on Windows and authoring the full proxy HostObject in C++/JSI. Animations run, but on the JS thread (no true off-thread UI animation). |
+| **A. Full worklets, concrete `HermesRuntime`** | **No — and a source build does not change this.** | `hermes/hermes.h` does not exist in the tree; Hermes-windows ships a C ABI only (§2b/§2c). Would require microsoft/hermes-windows to also ship the C++ VM headers/libs, or an upstream change. |
+| **A′. Second runtime via the Hermes C ABI** | **Unknown — worth a spike.** | `jsr_create_runtime` + `jsr_config_set_task_runner` + `NodeApiJsiRuntime` plausibly yields an off-thread `jsi::Runtime`. Requires reimplementing `WorkletHermesRuntime` on NAPI and re-solving worklet serialization. See `SPIKE.md`. |
+| **B. JS-thread-only worklets (no UI runtime)** | **Partially.** | Install `__workletsModuleProxy` over the existing `jsi::Runtime`; `scheduleOnUI`/`runOnUI`/`runOnRuntime` execute on the RN JS runtime. Needs the reanimated babel plugin re-enabled on Windows and the full proxy HostObject authored in C++/JSI. Animations run, but on the JS thread. |
 | **C. Status quo — pure-JS shims** | Shipping in our production app today. | reanimated static shim + worklets no-op shim. No animation; never crashes. |
 
 ## 3. Phased roadmap
@@ -101,10 +217,13 @@ the RN runtime) therefore cannot be constructed from an app project.
 
 ### Phase 1 — Decide the route
 
-**A** (RNW source build, real worklets) vs **B** (JS-thread executor).
-Recommendation: A if reanimated-heavy UI needs real 60fps off-thread
-animation; B is a cheaper stepping stone that already makes `'worklet'`
-functions execute for real.
+**A′** (second runtime over the Hermes C ABI) vs **B** (JS-thread executor).
+Route A as originally written — a concrete `facebook::hermes::HermesRuntime` —
+is off the table on this platform (§2b/§2c), so Phase 1 now *starts with*
+[`SPIKE.md`](SPIKE.md): a few days of work that answers whether A′ is real
+before anyone commits multi-week effort to it. If the spike passes, A′ is the
+route for true off-thread animation; if it fails, B is the ceiling and is still
+a genuine improvement over the status quo.
 
 ### Phase 2 — Option B: JS-thread worklet executor (medium)
 
@@ -121,7 +240,13 @@ functions execute for real.
 
 Real but bounded: a large HostObject, not a VM.
 
-### Phase 3 — Option A: real worklets in an RNW source build (multi-week)
+### Phase 3 — Option A′: real worklets in an RNW source build (multi-week, gated on the spike)
+
+> Revised: this phase is contingent on [`SPIKE.md`](SPIKE.md) passing. The
+> source build is necessary but **not** sufficient — see §2a. The UI runtime
+> below must be built on the Hermes **C ABI** (`jsr_create_runtime` +
+> `NodeApiJsiRuntime`), not on `facebook::hermes::HermesRuntime`, which does
+> not exist on Windows.
 
 Author the Windows platform port mirroring `apple/`:
 
@@ -134,10 +259,16 @@ Author the Windows platform port mirroring `apple/`:
   `DispatcherQueue`.
 - `WorkletsAnimationFrameQueue.{h,cpp}` — RAF via `DispatcherQueueTimer` /
   composition vsync.
-- `HermesUIRuntimeFactory.cpp` — the UI `facebook::hermes::HermesRuntime`,
-  linking the same Hermes the RNW instance uses (hence the source build).
-- Compile `Common/cpp/worklets/**` into that project; define
-  `JS_RUNTIME_HERMES`.
+- `HermesUIRuntimeFactory.cpp` — the UI runtime built via `jsr_create_config` /
+  `jsr_create_runtime` / `jsr_config_set_task_runner` /
+  `jsr_runtime_get_node_api_env`, wrapped with `NodeApiJsiRuntime` to yield a
+  `jsi::Runtime&` (mirroring `Shared/HermesRuntimeHolder.cpp`).
+- A **replacement for `WorkletHermesRuntime.{h,cpp}`** — it cannot be compiled
+  as shipped (§2b). Reimplement its surface on the NAPI runtime, and re-solve
+  worklet-function transfer without `facebook::hermes` bytecode APIs
+  (`jsr_create_prepared_script` is the likely substitute; unproven).
+- Compile the rest of `Common/cpp/worklets/**` into that project. Note that
+  defining `JS_RUNTIME_HERMES` alone does **not** work (§2d).
 
 ### Phase 4 — Reanimated bring-up + upstream
 
