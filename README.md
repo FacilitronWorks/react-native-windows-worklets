@@ -31,8 +31,9 @@ This repo is where we do the work in the open instead of in a private tree.
 | Animations of any kind | ❌ No |
 
 The scaffold is an extraction from a production monorepo's staging tree
-(Facilitron FIT for Windows, RNW 0.83.2 new-arch); its sibling modules ship in
-production, this one does not. Standalone build validation pending.
+(Facilitron FIT for Windows, RNW 0.83.2 new-arch, now RNW 0.85.0); its sibling
+modules ship in production, this one does not. Standalone build validation
+pending.
 
 ## Why this is genuinely hard (the one-paragraph version)
 
@@ -63,6 +64,34 @@ a `HermesRuntime`. Whether that is enough to carry worklets is **unknown, and
 we have not tried it.** [`docs/SPIKE.md`](docs/SPIKE.md) scopes the cheapest
 experiment that would settle it. Full receipts, with file paths, in
 [`docs/DESIGN.md`](docs/DESIGN.md) §2.
+
+### Re-checked for react-native-windows 0.85.0 and worklets 0.8.3 (November 2026)
+
+The blocker is unchanged on the newest versions an Expo app can use today
+(Expo SDK 56: react-native 0.85.3, react-native-worklets 0.8.3,
+react-native-windows 0.85.0; RNW has no 0.86 release yet):
+
+- **Hermes on Windows is still C-ABI only.** RNW 0.85.0's default engine
+  (`Microsoft.JavaScript.Hermes` `0.0.0-2608.12001-35d34796`, from
+  `PropertySheets/JSEngine.props`) and the newer `0.0.0-2608.24001-e8893e62`
+  ship the same headers as before: `hermes/hermes_api.h`,
+  `hermes/hermes_icu.h`, `hermes/js_runtime_api.h`, `jsi/*` and `node-api/*`.
+  There is still no `hermes/hermes.h` and no `facebook::hermes::HermesRuntime`.
+  The `jsr_*` entry points the second-runtime route needs
+  (`jsr_create_config`, `jsr_create_runtime`, `jsr_config_set_task_runner`,
+  `jsr_runtime_get_node_api_env`, `jsr_create_prepared_script`,
+  `jsr_run_script_buffer`) are all still in `js_runtime_api.h`.
+- **worklets 0.8.3 is more Hermes-bound, not less.**
+  `Common/cpp/worklets/WorkletRuntime/WorkletRuntime.cpp` still builds the UI
+  runtime with `facebook::hermes::makeHermesRuntime()` and wraps it in
+  `WorkletHermesRuntime`, and 0.8.x adds `HermesProfiling.cpp`, which calls
+  `HermesRuntime` static methods directly.
+- **The scaffold's RNW surface is unchanged.** The C++ module API it uses
+  (`REACT_MODULE`, `REACT_METHOD`, `ReactContext`, `IReactDispatcher`) is the
+  same in 0.85.0 as in 0.83.2.
+
+`docs/DESIGN.md` still describes worklets 0.7.4 file by file; its conclusions
+hold for 0.8.3 for the reasons above.
 
 ## The roadmap (honest sizes)
 
